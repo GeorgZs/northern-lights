@@ -182,6 +182,22 @@ Return JSON only with this structure:
             formatted = f"{cleaned_org_id[:6]}-{cleaned_org_id[6:]}"
             return {"type": "org_id", "confidence": 1.0, "reasoning": "Matches Swedish org number pattern"}
 
+        # Check if it's a complex query (contains question words or multiple clauses)
+        question_words = ["who", "what", "where", "when", "why", "how", "which", "show", "list", "find", "tell"]
+        has_question = any(word in query.lower() for word in question_words)
+        has_multiple_clauses = len(query.split()) > 5 or (" and " in query.lower() or " or " in query.lower())
+        
+        if has_question or has_multiple_clauses:
+            return {"type": "general_query", "confidence": 0.8, "reasoning": "Contains question words or multiple clauses"}
+
+        # Check if it's a simple company name (1-5 words, alphanumeric with common company suffixes)
+        words = query.split()
+        if 1 <= len(words) <= 5:
+            # Simple pattern: alphanumeric, spaces, common company suffixes
+            company_pattern = re.compile(r"^[A-Za-zÅÄÖåäö0-9\s&\-\.]{1,100}$")
+            if company_pattern.match(query):
+                return {"type": "company_name", "confidence": 0.9, "reasoning": "Simple company name pattern (1-5 words)"}
+
         # Default to general_query for fallback (safer to forward to Neo4j agent)
         return {"type": "general_query", "confidence": 0.3, "reasoning": "Fallback: defaulting to general query"}
 
@@ -242,6 +258,8 @@ class CompanyAgentTools:
             return {k: self._convert_neo4j_to_json(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._convert_neo4j_to_json(item) for item in obj]
+        else:
+            return obj
 
     async def search_database(self, query: str) -> str:
         """
@@ -253,53 +271,23 @@ class CompanyAgentTools:
         Returns:
             JSON string with search results
         """
-
-        # Validate input
-        validation = InputValidator.validate_input(query)
-        if not validation["valid"]:
-            return json.dumps({"found": False, "error": validation["error"]})
-
-        query_type = validation["type"]
-        cleaned_query = validation["cleaned"]
-
         try:
-            if query_type == "org_id":
-                # Search by organization ID
-                company = company_queries.get_company(cleaned_query)
-                if company:
-                    # Convert Neo4j objects to JSON-serializable format
-                    company_json = self._convert_neo4j_to_json(company)
-                    return json.dumps({"found": True, "data": company_json, "query_type": "org_id"})
-                else:
-                    return json.dumps({"found": False, "query": cleaned_query, "query_type": "org_id"})
+            # Try by organization ID first
+            company = company_queries.get_company(query)
+            if company:
+                company_json = self._convert_neo4j_to_json(company)
+                return json.dumps({"found": True, "data": company_json, "query_type": "org_id"})
 
-            elif query_type == "company_name":
-                # Search by company name in Neo4j
-                from app.db.neo4j_client import get_driver
-
-                driver = get_driver()
-                with driver.session() as session:
-                    result = session.run(
-                        """
-                        MATCH (c)
-                        WHERE (c:Company OR c:Fund)
-                          AND toLower(c.name) = toLower($name)
-                        RETURN c
-                        LIMIT 1
-                        """,
-                        name=cleaned_query,
-                    )
-
-                    record = result.single()
-                    if record:
-                        company_node = record["c"]
-                        # Convert node to dictionary
-                        company_dict = dict(company_node.items())
-                        # Convert Neo4j objects to JSON-serializable format
-                        company_json = self._convert_neo4j_to_json(company_dict)
-                        return json.dumps({"found": True, "data": company_json, "query_type": "company_name"})
-                    else:
-                        return json.dumps({"found": False, "query": cleaned_query, "query_type": "company_name"})
+            # Try by company name using the proper function
+            company = company_queries.find_company_by_name(query)
+            if company:
+                logger.debug(f"Company found: type={type(company)}, keys={list(company.keys()) if isinstance(company, dict) else 'not a dict'}")
+                logger.debug(f"Company name: {repr(company.get('name'))}, company_id: {repr(company.get('company_id'))}")
+                company_json = self._convert_neo4j_to_json(company)
+                logger.debug(f"After conversion - name: {repr(company_json.get('name'))}, company_id: {repr(company_json.get('company_id'))}")
+                return json.dumps({"found": True, "data": company_json, "query_type": "company_name"})
+            else:
+                return json.dumps({"found": False, "query": query, "query_type": "company_name"})
 
         except Exception as e:
             logger.error(f"Error searching database: {e}")
@@ -719,77 +707,101 @@ async def process_query(query: str) -> AgentResponse:
                 )
 
         # Step 3: For company_name/org_id, search database
-        search_result_str = await tools.search_database(cleaned_query)
+        ## if we do not pass to agent we just no id or name lookup
+        search_result_str = await tools.search_database(query)
         search_result = json.loads(search_result_str)
 
-        # Step 4: If found, query Neo4j agent
+        logger.info(f"Search result: {search_result}")
+
+        # Step 4: If found, validate company data and query Neo4j agent
         if search_result.get("found"):
             company_data = search_result.get("data")
-            company_name = company_data.get("name", "Unknown")
-            company_id = company_data.get("company_id") or company_data.get("organization_id", "N/A")
+            logger.debug(f"Company search returned data with keys: {list(company_data.keys()) if company_data else 'None'}")
+            logger.debug(f"Company data values - name: {repr(company_data.get('name'))}, company_id: {repr(company_data.get('company_id'))}, organization_id: {repr(company_data.get('organization_id'))}")
+            
+            company_name = company_data.get("name")
+            company_id = company_data.get("company_id") or company_data.get("organization_id")
+            
+            # Validate that we have essential company data
+            # company_id is required (must exist on the node)
+            # company_name can be None/empty for some nodes, but we'll use a fallback
+            if not company_id or company_id is None:
+                logger.warning(
+                    f"Company search returned data but missing company_id for '{cleaned_query}': "
+                    f"name={repr(company_name)}, id={repr(company_id)}. Treating as not found."
+                )
+                # Fall through to ingestion step
+            else:
+                # Use company_id as fallback name if name is missing
+                if not company_name or company_name is None:
+                    company_name = company_id
+                    logger.debug(f"Using company_id as name fallback: {company_name}")
+                # Build detailed company info in markdown
+                company_details = f"## ✓ Company Found: **{company_name}**\n\n"
+                company_details += f"**Organization ID:** `{company_id}`\n\n"
 
-            # Build detailed company info in markdown
-            company_details = f"## ✓ Company Found: **{company_name}**\n\n"
-            company_details += f"**Organization ID:** `{company_id}`\n\n"
+                if company_data.get("description"):
+                    company_details += f"**Description:**\n{company_data['description']}\n\n"
 
-            if company_data.get("description"):
-                company_details += f"**Description:**\n{company_data['description']}\n\n"
+                if company_data.get("sectors") and len(company_data["sectors"]) > 0:
+                    sectors = company_data["sectors"]
+                    if isinstance(sectors, list):
+                        # Filter out None values before joining
+                        valid_sectors = [str(s) for s in sectors if s is not None]
+                        if valid_sectors:
+                            company_details += f"**Sectors:** {', '.join(valid_sectors)}\n\n"
+                    else:
+                        if sectors is not None:
+                            company_details += f"**Sectors:** {sectors}\n\n"
 
-            if company_data.get("sectors") and len(company_data["sectors"]) > 0:
-                sectors = company_data["sectors"]
-                if isinstance(sectors, list):
-                    company_details += f"**Sectors:** {', '.join(sectors)}\n\n"
-                else:
-                    company_details += f"**Sectors:** {sectors}\n\n"
+                details_added = False
+                if company_data.get("website"):
+                    company_details += f"**Website:** [{company_data['website']}]({company_data['website']})\n"
+                    details_added = True
+                if company_data.get("year_founded"):
+                    company_details += f"**Founded:** {company_data['year_founded']}\n"
+                    details_added = True
+                if company_data.get("num_employees"):
+                    company_details += f"**Employees:** {company_data['num_employees']}\n"
+                    details_added = True
+                if company_data.get("country_code"):
+                    company_details += f"**Country:** {company_data['country_code']}\n"
+                    details_added = True
 
-            details_added = False
-            if company_data.get("website"):
-                company_details += f"**Website:** [{company_data['website']}]({company_data['website']})\n"
-                details_added = True
-            if company_data.get("year_founded"):
-                company_details += f"**Founded:** {company_data['year_founded']}\n"
-                details_added = True
-            if company_data.get("num_employees"):
-                company_details += f"**Employees:** {company_data['num_employees']}\n"
-                details_added = True
-            if company_data.get("country_code"):
-                company_details += f"**Country:** {company_data['country_code']}\n"
-                details_added = True
+                if details_added:
+                    company_details += "\n"
 
-            if details_added:
-                company_details += "\n"
+                # Query Neo4j agent for additional information
+                logger.info(f"Querying Neo4j agent for additional info about {company_name} ({company_id})")
+                neo4j_result_str = await tools.query_neo4j_agent(json.dumps(company_data))
 
-            # Query Neo4j agent for additional information
-            logger.info(f"Querying Neo4j agent for additional info about {company_name} ({company_id})")
-            neo4j_result_str = await tools.query_neo4j_agent(json.dumps(company_data))
+                try:
+                    neo4j_result = json.loads(neo4j_result_str)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Neo4j agent response is not JSON: {e}, using database data only")
+                    company_details += "*Showing information from our database.*"
+                    return AgentResponse(
+                        message=company_details,
+                        company_found=True,
+                        company_data=company_data,
+                    )
 
-            try:
-                neo4j_result = json.loads(neo4j_result_str)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Neo4j agent response is not JSON: {e}, using database data only")
-                company_details += "*Showing information from our database.*"
+                if neo4j_result.get("error"):
+                    logger.warning(f"Neo4j agent returned error: {neo4j_result.get('error')}, using database data only")
+                    company_details += "*Showing information from our database.*"
+                    return AgentResponse(
+                        message=company_details,
+                        company_found=True,
+                        company_data=company_data,
+                    )
+
+                logger.info(f"Neo4j agent provided additional insights for {company_name}")
+                company_details += "*Additional insights from our knowledge graph...*"
                 return AgentResponse(
                     message=company_details,
                     company_found=True,
-                    company_data=company_data,
+                    company_data=neo4j_result.get("data", company_data),
                 )
-
-            if neo4j_result.get("error"):
-                logger.warning(f"Neo4j agent returned error: {neo4j_result.get('error')}, using database data only")
-                company_details += "*Showing information from our database.*"
-                return AgentResponse(
-                    message=company_details,
-                    company_found=True,
-                    company_data=company_data,
-                )
-
-            logger.info(f"Neo4j agent provided additional insights for {company_name}")
-            company_details += "*Additional insights from our knowledge graph...*"
-            return AgentResponse(
-                message=company_details,
-                company_found=True,
-                company_data=neo4j_result.get("data", company_data),
-            )
 
         # Step 5: Not found - trigger ingestion
         logger.info(f"Company not found with query '{cleaned_query}' - triggering ingestion")
